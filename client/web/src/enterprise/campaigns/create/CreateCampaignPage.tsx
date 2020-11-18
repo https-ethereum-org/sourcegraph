@@ -1,9 +1,7 @@
-import React, { useCallback, useMemo, useState } from 'react'
+import React, { useCallback, useState } from 'react'
 import { PageTitle } from '../../../components/PageTitle'
 import { PageHeader } from '../../../components/PageHeader'
-import { CampaignsFlushEdgesIcon } from '../icons'
-import { BreadcrumbSetters } from '../../../components/Breadcrumbs'
-import { AuthenticatedUser } from '../../../auth'
+import { CampaignsIconFlushLeft } from '../icons'
 import helloWorldSample from './samples/empty.campaign.yaml'
 import combySample from './samples/comby.campaign.yaml'
 import goImportsSample from './samples/go-imports.campaign.yaml'
@@ -46,30 +44,16 @@ const samples: Sample[] = [
     { name: 'minimal.campaign.yaml', file: minimalSample },
 ]
 
-export interface CreateCampaignPageProps extends BreadcrumbSetters {
-    authenticatedUser: Pick<AuthenticatedUser, 'username'>
+export interface CreateCampaignPageProps {
+    // Nothing for now.
 }
 
-export const CreateCampaignPage: React.FunctionComponent<CreateCampaignPageProps> = ({
-    authenticatedUser,
-    useBreadcrumb,
-}) => {
+export const CreateCampaignPage: React.FunctionComponent<CreateCampaignPageProps> = () => {
     const [selectedSample, setSelectedSample] = useState<Sample>(samples[0])
-    useBreadcrumb(useMemo(() => ({ element: <>Create campaign</>, key: 'createCampaignPage' }), []))
     return (
         <>
             <PageTitle title="Create campaign" />
-            <PageHeader
-                icon={CampaignsFlushEdgesIcon}
-                title={
-                    <>
-                        Create campaign{' '}
-                        <sup>
-                            <span className="badge badge-merged text-uppercase">Beta</span>
-                        </sup>
-                    </>
-                }
-            />
+            <PageHeader icon={CampaignsIconFlushLeft} title="Create campaign" />
             <div className="pt-3">
                 <h2>1. Write a campaign spec YAML file</h2>
                 <p>
@@ -104,11 +88,7 @@ export const CreateCampaignPage: React.FunctionComponent<CreateCampaignPageProps
                     </a>{' '}
                     to preview the commits and changesets that your campaign will make:
                 </p>
-                <CodeSnippet
-                    code={`src campaign preview -namespace ${authenticatedUser.username} -f ${selectedSample.name}`}
-                    language="shell"
-                    className="mb-3"
-                />
+                <CodeSnippet code={`src campaign preview -f ${selectedSample.name}`} language="bash" className="mb-3" />
                 <p>
                     Follow the URL printed in your terminal to see the preview and (when you're ready) create the
                     campaign.

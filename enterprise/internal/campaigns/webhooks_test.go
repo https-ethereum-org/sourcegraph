@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/webhooks"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -53,7 +54,7 @@ func testGitHubWebhook(db *sql.DB, userID int32) func(*testing.T) {
 		extSvc := &repos.ExternalService{
 			Kind:        extsvc.KindGitHub,
 			DisplayName: "GitHub",
-			Config: marshalJSON(t, &schema.GitHubConnection{
+			Config: ct.MarshalJSON(t, &schema.GitHubConnection{
 				Url:      "https://github.com",
 				Token:    os.Getenv("GITHUB_TOKEN"),
 				Repos:    []string{"sourcegraph/sourcegraph"},
@@ -128,7 +129,7 @@ func testGitHubWebhook(db *sql.DB, userID int32) func(*testing.T) {
 		})
 		defer state.Unmock()
 
-		err = SyncChangesets(ctx, repoStore, store, repos.NewSourcer(cf), changeset)
+		err = SyncChangeset(ctx, repoStore, store, githubSrc, githubRepo, changeset)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -151,6 +152,11 @@ func testGitHubWebhook(db *sql.DB, userID int32) func(*testing.T) {
 				// Send all events twice to ensure we are idempotent
 				for i := 0; i < 2; i++ {
 					for _, event := range tc.Payloads {
+						handler := webhooks.GitHubWebhook{
+							Repos: repoStore,
+						}
+						hook.Register(&handler)
+
 						u := extsvc.WebhookURL(extsvc.TypeGitHub, extSvc.ID, "https://example.com/")
 
 						req, err := http.NewRequest("POST", u, bytes.NewReader(event.Data))
@@ -161,7 +167,7 @@ func testGitHubWebhook(db *sql.DB, userID int32) func(*testing.T) {
 						req.Header.Set("X-Hub-Signature", sign(t, event.Data, []byte(secret)))
 
 						rec := httptest.NewRecorder()
-						hook.ServeHTTP(rec, req)
+						handler.ServeHTTP(rec, req)
 						resp := rec.Result()
 
 						if resp.StatusCode != http.StatusOK {
@@ -221,7 +227,7 @@ func testBitbucketWebhook(db *sql.DB, userID int32) func(*testing.T) {
 		extSvc := &repos.ExternalService{
 			Kind:        extsvc.KindBitbucketServer,
 			DisplayName: "Bitbucket",
-			Config: marshalJSON(t, &schema.BitbucketServerConnection{
+			Config: ct.MarshalJSON(t, &schema.BitbucketServerConnection{
 				Url:   "https://bitbucket.sgdev.org",
 				Token: os.Getenv("BITBUCKET_SERVER_TOKEN"),
 				Repos: []string{"SOUR/automation-testing"},
@@ -295,12 +301,6 @@ func testBitbucketWebhook(db *sql.DB, userID int32) func(*testing.T) {
 			},
 		}
 
-		for _, ch := range changesets {
-			if err = store.CreateChangeset(ctx, ch); err != nil {
-				t.Fatal(err)
-			}
-		}
-
 		// Set up mocks to prevent the diffstat computation from trying to
 		// use a real gitserver, and so we can control what diff is used to
 		// create the diffstat.
@@ -310,9 +310,15 @@ func testBitbucketWebhook(db *sql.DB, userID int32) func(*testing.T) {
 		})
 		defer state.Unmock()
 
-		err = SyncChangesets(ctx, repoStore, store, repos.NewSourcer(cf), changesets...)
-		if err != nil {
-			t.Fatal(err)
+		for _, ch := range changesets {
+			if err := store.CreateChangeset(ctx, ch); err != nil {
+				t.Fatal(err)
+			}
+
+			err = SyncChangeset(ctx, repoStore, store, bitbucketSource, bitbucketRepo, ch)
+			if err != nil {
+				t.Fatal(err)
+			}
 		}
 
 		hook := NewBitbucketServerWebhook(store, repoStore, clock, "testhook")
@@ -456,15 +462,4 @@ func sign(t *testing.T, message, secret []byte) string {
 	}
 
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
-}
-
-func marshalJSON(t testing.TB, v interface{}) string {
-	t.Helper()
-
-	bs, err := json.Marshal(v)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return string(bs)
 }

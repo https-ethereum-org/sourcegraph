@@ -1,8 +1,10 @@
 package worker
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -13,15 +15,11 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
 	"github.com/sourcegraph/sourcegraph/enterprise/cmd/precise-code-intel-worker/internal/correlation"
-	"github.com/sourcegraph/sourcegraph/enterprise/cmd/precise-code-intel-worker/internal/metrics"
-	bundles "github.com/sourcegraph/sourcegraph/enterprise/internal/codeintel/bundles/client"
-	"github.com/sourcegraph/sourcegraph/enterprise/internal/codeintel/bundles/persistence"
-	"github.com/sourcegraph/sourcegraph/enterprise/internal/codeintel/bundles/types"
-	"github.com/sourcegraph/sourcegraph/enterprise/internal/codeintel/bundles/util"
 	"github.com/sourcegraph/sourcegraph/enterprise/internal/codeintel/gitserver"
-	"github.com/sourcegraph/sourcegraph/enterprise/internal/codeintel/store"
+	store "github.com/sourcegraph/sourcegraph/enterprise/internal/codeintel/stores/dbstore"
+	"github.com/sourcegraph/sourcegraph/enterprise/internal/codeintel/stores/lsifstore"
+	"github.com/sourcegraph/sourcegraph/enterprise/internal/codeintel/stores/uploadstore"
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/observation"
 	"github.com/sourcegraph/sourcegraph/internal/vcs"
 	"github.com/sourcegraph/sourcegraph/internal/workerutil"
 	"github.com/sourcegraph/sourcegraph/internal/workerutil/dbworker"
@@ -29,17 +27,12 @@ import (
 )
 
 type handler struct {
-	store               store.Store
-	bundleManagerClient bundles.BundleManagerClient
-	gitserverClient     gitserverClient
-	metrics             metrics.WorkerMetrics
-	enableBudget        bool
-	budgetRemaining     int64
-	createStore         func(id int) persistence.Store
-}
-
-type gitserverClient interface {
-	DirectoryChildren(ctx context.Context, store store.Store, repositoryID int, commit string, dirnames []string) (map[string][]string, error)
+	dbStore         DBStore
+	lsifStore       LSIFStore
+	uploadStore     uploadstore.Store
+	gitserverClient GitserverClient
+	enableBudget    bool
+	budgetRemaining int64
 }
 
 var _ dbworker.Handler = &handler{}
@@ -47,10 +40,7 @@ var _ workerutil.WithPreDequeue = &handler{}
 var _ workerutil.WithHooks = &handler{}
 
 func (h *handler) Handle(ctx context.Context, tx dbworkerstore.Store, record workerutil.Record) error {
-	upload := record.(store.Upload)
-	store := h.store.With(tx)
-
-	_, err := h.handle(ctx, store, upload)
+	_, err := h.handle(ctx, h.dbStore.With(tx), record.(store.Upload))
 	return err
 }
 
@@ -83,58 +73,24 @@ func (h *handler) getSize(record workerutil.Record) int64 {
 	return 0
 }
 
-// CloneInProgressDelay is the delay between processing attempts when a repo is currently being cloned.
-const CloneInProgressDelay = time.Minute
-
 // handle converts a raw upload into a dump within the given transaction context. Returns true if the
 // upload record was requeued and false otherwise.
-func (h *handler) handle(ctx context.Context, store store.Store, upload store.Upload) (_ bool, err error) {
-	// Ensure that the repo and revision are resolvable. If the repo does not exist, or if the repo has finished
-	// cloning and the revision does not exist, then the upload will fail to process. If the repo is currently
-	// cloning, then we'll requeue the upload to be tried again later. This will not increase the reset count
-	// of the record (so this doesn't count against the upload as a legitimate attempt).
-	if cloneInProgress, err := h.isRepoCurrentlyCloning(ctx, upload.RepositoryID, upload.Commit); err != nil {
-		return false, err
-	} else if cloneInProgress {
-		if err := store.Requeue(ctx, upload.ID, time.Now().UTC().Add(CloneInProgressDelay)); err != nil {
-			return false, errors.Wrap(err, "store.Requeue")
-		}
-
-		return true, nil
+func (h *handler) handle(ctx context.Context, dbStore DBStore, upload store.Upload) (requeued bool, err error) {
+	if requeued, err := requeueIfCloning(ctx, dbStore, upload); err != nil || requeued {
+		return requeued, err
 	}
-
-	// Pull raw uploaded data from bundle manager
-	r, err := h.bundleManagerClient.GetUpload(ctx, upload.ID)
-	if err != nil {
-		return false, errors.Wrap(err, "bundleManager.GetUpload")
-	}
-	defer func() {
-		if err == nil {
-			// Remove upload file after processing - we don't need it anymore. On failure we
-			// may want to retry, so we should keep the upload data around for a bit. The bundle
-			// manager will clean up old uploads periodically.
-			if deleteErr := h.bundleManagerClient.DeleteUpload(ctx, upload.ID); deleteErr != nil {
-				log15.Warn("Failed to delete upload file", "err", err)
-			}
-		}
-	}()
 
 	getChildren := func(ctx context.Context, dirnames []string) (map[string][]string, error) {
-		directoryChildren, err := h.gitserverClient.DirectoryChildren(ctx, store, upload.RepositoryID, upload.Commit, dirnames)
+		directoryChildren, err := h.gitserverClient.DirectoryChildren(ctx, upload.RepositoryID, upload.Commit, dirnames)
 		if err != nil {
 			return nil, errors.Wrap(err, "gitserverClient.DirectoryChildren")
 		}
 		return directoryChildren, nil
 	}
 
-	groupedBundleData, err := correlation.Correlate(ctx, r, upload.ID, upload.Root, getChildren, h.metrics)
-	if err != nil {
-		return false, errors.Wrap(err, "correlation.Correlate")
-	}
-
 	var baseID *int
 	if upload.BaseCommit != nil {
-		baseDump, exists, err := store.GetDumpForCommit(ctx, upload.RepositoryID, *upload.BaseCommit, upload.Indexer, upload.Root)
+		baseDump, exists, err := h.dbStore.GetDumpForCommit(ctx, upload.RepositoryID, *upload.BaseCommit, upload.Indexer, upload.Root)
 		if err != nil {
 			return false, err
 		}
@@ -149,72 +105,136 @@ func (h *handler) handle(ctx context.Context, store store.Store, upload store.Up
 		}
 	}
 
-	if err := h.write(ctx, store, upload.ID, upload.RepositoryID, upload.Commit, baseID, upload.BaseCommit, groupedBundleData); err != nil {
-		return false, err
-	}
+	return false, withUploadData(ctx, h.uploadStore, upload.ID, func(r io.Reader) (err error) {
+		groupedBundleData, err := correlation.Correlate(ctx, r, upload.ID, upload.Root, getChildren)
+		if err != nil {
+			return errors.Wrap(err, "correlation.Correlate")
+		}
 
-	// Start a nested transaction. In the event that something after this point fails, we want to
-	// update the upload record with an error message but do not want to alter any other data in
-	// the database. Rolling back to this savepoint will allow us to discard any other changes
-	// but still commit the transaction as a whole.
+		if err := h.writeData(ctx, upload.ID, upload.RepositoryID, baseID, upload.Commit, upload.BaseCommit, groupedBundleData); err != nil {
+			return err
+		}
 
-	// with Postgres savepoints. In the event that something after this point fails, we want to
-	// update the upload record with an error message but do not want to alter any other data in
-	// the database. Rolling back to this savepoint will allow us to discard any other changes
-	// but still commit the transaction as a whole.
-	tx, err := store.Transact(ctx)
-	if err != nil {
-		return false, errors.Wrap(err, "store.Transact")
-	}
-	defer func() {
-		err = tx.Done(err)
-	}()
+		// Start a nested transaction. In the event that something after this point fails, we want to
+		// update the upload record with an error message but do not want to alter any other data in
+		// the database. Rolling back to this savepoint will allow us to discard any other changes
+		// but still commit the transaction as a whole.
 
-	if err := h.updateXrepoData(ctx, store, upload, groupedBundleData.Packages, groupedBundleData.PackageReferences); err != nil {
-		return false, err
-	}
+		// with Postgres savepoints. In the event that something after this point fails, we want to
+		// update the upload record with an error message but do not want to alter any other data in
+		// the database. Rolling back to this savepoint will allow us to discard any other changes
+		// but still commit the transaction as a whole.
+		tx, err := dbStore.Transact(ctx)
+		if err != nil {
+			return errors.Wrap(err, "store.Transact")
+		}
+		defer func() { err = tx.Done(err) }()
 
-	return false, nil
+		// Update package and package reference data to support cross-repo queries.
+		if err := tx.UpdatePackages(ctx, groupedBundleData.Packages); err != nil {
+			return errors.Wrap(err, "store.UpdatePackages")
+		}
+		if err := tx.UpdatePackageReferences(ctx, groupedBundleData.PackageReferences); err != nil {
+			return errors.Wrap(err, "store.UpdatePackageReferences")
+		}
+
+		// Before we mark the upload as complete, we need to delete any existing completed uploads
+		// that have the same repository_id, commit, root, and indexer values. Otherwise the transaction
+		// will fail as these values form a unique constraint.
+		if err := tx.DeleteOverlappingDumps(ctx, upload.RepositoryID, upload.Commit, upload.Root, upload.Indexer); err != nil {
+			return errors.Wrap(err, "store.DeleteOverlappingDumps")
+		}
+
+		// Almost-success: we need to mark this upload as complete at this point as the next step changes
+		// the visibility of the dumps for this repository. This requires that the new dump be available in
+		// the lsif_dumps view, which requires a change of state. In the event of a future failure we can
+		// still roll back to the save point and mark the upload as errored.
+		if err := tx.MarkComplete(ctx, upload.ID); err != nil {
+			return errors.Wrap(err, "store.MarkComplete")
+		}
+
+		// Mark this repository so that the commit updater process will pull the full commit graph from
+		// gitserver and recalculate the nearest upload for each commit as well as which uploads are visible
+		// from the tip of the default branch. We don't do this inside of the transaction as we re-calcalute
+		// the entire set of data from scratch and we want to be able to coalesce requests for the same
+		// repository rather than having a set of uploads for the same repo re-calculate nearly identical
+		// data multiple times.
+		if err := tx.MarkRepositoryAsDirty(ctx, upload.RepositoryID); err != nil {
+			return errors.Wrap(err, "store.MarkRepositoryDirty")
+		}
+
+		return nil
+	})
 }
 
-// isRepoCurrentlyCloning determines if the target repository is currently being cloned.
-// This function returns an error if the repo or commit cannot be resolved.
-func (h *handler) isRepoCurrentlyCloning(ctx context.Context, repoID int, commit string) (_ bool, err error) {
-	ctx, endOperation := h.metrics.RepoStateOperation.With(ctx, &err, observation.Args{})
-	defer endOperation(1, observation.Args{})
+// CloneInProgressDelay is the delay between processing attempts when a repo is currently being cloned.
+const CloneInProgressDelay = time.Minute
 
-	repo, err := backend.Repos.Get(ctx, api.RepoID(repoID))
+// requeueIfCloning ensures that the repo and revision are resolvable. If the repo does not exist, or
+// if the repo has finished cloning and the revision does not exist, then the upload will fail to process.
+// If the repo is currently cloning, then we'll requeue the upload to be tried again later. This will not
+// increase the reset count of the record (so this doesn't count against the upload as a legitimate attempt).
+func requeueIfCloning(ctx context.Context, dbStore DBStore, upload store.Upload) (requeued bool, _ error) {
+	repo, err := backend.Repos.Get(ctx, api.RepoID(upload.RepositoryID))
 	if err != nil {
 		return false, errors.Wrap(err, "Repos.Get")
 	}
 
-	if _, err := backend.Repos.ResolveRev(ctx, repo, commit); err != nil {
-		if vcs.IsCloneInProgress(err) {
-			return true, nil
+	if _, err := backend.Repos.ResolveRev(ctx, repo, upload.Commit); err != nil {
+		if !vcs.IsCloneInProgress(err) {
+			return false, errors.Wrap(err, "Repos.ResolveRev")
 		}
 
-		return false, errors.Wrap(err, "Repos.ResolveRev")
+		if err := dbStore.Requeue(ctx, upload.ID, time.Now().UTC().Add(CloneInProgressDelay)); err != nil {
+			return false, errors.Wrap(err, "store.Requeue")
+		}
+
+		return true, nil
 	}
 
 	return false, nil
 }
 
-// write commits the correlated data to the database.
-func (h *handler) write(ctx context.Context, store store.Store, dumpID, repositoryID int, commit string, baseID *int, baseCommit *string, groupedBundleData *correlation.GroupedBundleData) (err error) {
-	ctx, endOperation := h.metrics.WriteOperation.With(ctx, &err, observation.Args{})
-	defer endOperation(1, observation.Args{})
+// withUploadData will invoke the given function with a reader of the upload's raw data. The
+// consumer should expect raw newline-delimited JSON content. If the function returns without
+// an error, the upload file will be deleted.
+func withUploadData(ctx context.Context, uploadStore uploadstore.Store, id int, fn func(r io.Reader) error) error {
+	uploadFilename := fmt.Sprintf("upload-%d.lsif.gz", id)
+
+	// Pull raw uploaded data from bucket
+	rc, err := uploadStore.Get(ctx, uploadFilename)
+	if err != nil {
+		return errors.Wrap(err, "uploadStore.Get")
+	}
+	defer rc.Close()
+
+	rc, err = gzip.NewReader(rc)
+	if err != nil {
+		return errors.Wrap(err, "gzip.NewReader")
+	}
+	defer rc.Close()
+
+	if err := fn(rc); err != nil {
+		return err
+	}
+
+	if err := uploadStore.Delete(ctx, uploadFilename); err != nil {
+		log15.Warn("Failed to delete upload file", "err", err, "filename", uploadFilename)
+	}
+
+	return nil
+}
+
+// writeData transactionally writes the given grouped bundle data into the given LSIF store.
+func (h *handler) writeData(ctx context.Context, id, repositoryID int, baseID *int, commit string, baseCommit *string, groupedBundleData *correlation.GroupedBundleData) (err error) {
+	tx, err := h.lsifStore.Transact(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { err = tx.Done(err) }()
 
 	if baseID != nil {
-		baseStore := h.createStore(*baseID)
-		baseStore, err = baseStore.Transact(ctx)
-		if err != nil {
-			return errors.Wrap(err, "baseStore.Transact")
-		}
-		defer func() {
-			err = baseStore.Done(err)
-		}()
-
-		fileStatus, err := gitserver.DiffFileStatus(ctx, store, repositoryID, *baseCommit, commit)
+		fileStatus, err := h.gitserverClient.DiffFileStatus(ctx, repositoryID, *baseCommit, commit)
 		if err != nil {
 			return errors.Wrap(err, "gitserver.DiffFileStatus")
 		}
@@ -226,88 +246,37 @@ func (h *handler) write(ctx context.Context, store store.Store, dumpID, reposito
 			}
 		}
 
-		reindexedFiles, err := persistence.DocumentsReferencing(ctx, baseStore, diffedPaths)
+		reindexedFiles, err := h.lsifStore.DocumentsReferencing(ctx, *baseID, diffedPaths)
 		if err != nil {
-			return errors.Wrap(err, "persistence.DocumentsReferencing")
+			return errors.Wrap(err, "lsifStore.DocumentsReferencing")
 		}
 
-		groupedBundleData, err = patchData(ctx, baseStore, groupedBundleData, reindexedFiles, fileStatus)
+		groupedBundleData, err = patchData(ctx, h.lsifStore, *baseID, groupedBundleData, reindexedFiles, fileStatus)
 		if err != nil {
 			return errors.Wrap(err, "patchData")
 		}
 	}
 
-	writeStore := h.createStore(dumpID)
-	writeStore, err = writeStore.Transact(ctx)
-	if err != nil {
-		return errors.Wrap(err, "writeStore.Transact")
-	}
-	defer func() {
-		err = writeStore.Done(err)
-	}()
-
-	if err := writeStore.CreateTables(ctx); err != nil {
-		return errors.Wrap(err, "store.CreateTables")
-	}
-	if err := writeStore.WriteMeta(ctx, groupedBundleData.Meta); err != nil {
+	if err := tx.WriteMeta(ctx, id, groupedBundleData.Meta); err != nil {
 		return errors.Wrap(err, "store.WriteMeta")
 	}
-	if err := writeStore.WriteDocuments(ctx, groupedBundleData.Documents); err != nil {
+	if err := tx.WriteDocuments(ctx, id, groupedBundleData.Documents); err != nil {
 		return errors.Wrap(err, "store.WriteDocuments")
 	}
-	if err := writeStore.WriteResultChunks(ctx, groupedBundleData.ResultChunks); err != nil {
-		return errors.Wrap(err, "writer.WriteResultChunks")
+	if err := tx.WriteResultChunks(ctx, id, groupedBundleData.ResultChunks); err != nil {
+		return errors.Wrap(err, "store.WriteResultChunks")
 	}
-	if err := writeStore.WriteDefinitions(ctx, groupedBundleData.Definitions); err != nil {
+	if err := tx.WriteDefinitions(ctx, id, groupedBundleData.Definitions); err != nil {
 		return errors.Wrap(err, "store.WriteDefinitions")
 	}
-	if err := writeStore.WriteReferences(ctx, groupedBundleData.References); err != nil {
+	if err := tx.WriteReferences(ctx, id, groupedBundleData.References); err != nil {
 		return errors.Wrap(err, "store.WriteReferences")
 	}
 
 	return nil
 }
 
-// TODO(efritz) - refactor/simplify this after last change
-func (h *handler) updateXrepoData(ctx context.Context, store store.Store, upload store.Upload, packages []types.Package, packageReferences []types.PackageReference) (err error) {
-	ctx, endOperation := h.metrics.UpdateXrepoDatabaseOperation.With(ctx, &err, observation.Args{})
-	defer endOperation(1, observation.Args{})
-
-	// Update package and package reference data to support cross-repo queries.
-	if err := store.UpdatePackages(ctx, packages); err != nil {
-		return errors.Wrap(err, "store.UpdatePackages")
-	}
-	if err := store.UpdatePackageReferences(ctx, packageReferences); err != nil {
-		return errors.Wrap(err, "store.UpdatePackageReferences")
-	}
-
-	// Before we mark the upload as complete, we need to delete any existing completed uploads
-	// that have the same repository_id, commit, root, and indexer values. Otherwise the transaction
-	// will fail as these values form a unique constraint.
-	if err := store.DeleteOverlappingDumps(ctx, upload.RepositoryID, upload.Commit, upload.Root, upload.Indexer); err != nil {
-		return errors.Wrap(err, "store.DeleteOverlappingDumps")
-	}
-
-	// Almost-success: we need to mark this upload as complete at this point as the next step changes	// the visibility of the dumps for this repository. This requires that the new dump be available in
-	// the lsif_dumps view, which requires a change of state. In the event of a future failure we can
-	// still roll back to the save point and mark the upload as errored.
-	if err := store.MarkComplete(ctx, upload.ID); err != nil {
-		return errors.Wrap(err, "store.MarkComplete")
-	}
-
-	// Mark this repository so that the commit updater process will pull the full commit graph from gitserver
-	// and recalculate the nearest upload for each commit as well as which uploads are visible from the tip of
-	// the default branch. We don't do this inside of the transaction as we re-calcalute the entire set of data
-	// from scratch and we want to be able to coalesce requests for the same repository rather than having a set
-	// of uploads for the same repo re-calculate nearly identical data multiple times.
-	if err := store.MarkRepositoryAsDirty(ctx, upload.RepositoryID); err != nil {
-		return errors.Wrap(err, "store.MarkRepositoryDirty")
-	}
-
-	return nil
-}
-
-func patchData(ctx context.Context, base persistence.Store, patch *correlation.GroupedBundleData, reindexedFiles []string, fileStatus map[string]gitserver.Status) (patched *correlation.GroupedBundleData, err error) {
+func patchData(ctx context.Context, lsifStore LSIFStore, baseBundleID int, patch *correlation.GroupedBundleData, reindexedFiles []string, fileStatus map[string]gitserver.Status) (patched *correlation.GroupedBundleData, err error) {
 	log15.Warn("loading patch data...")
 
 	reindexed := make(map[string]struct{})
@@ -315,30 +284,30 @@ func patchData(ctx context.Context, base persistence.Store, patch *correlation.G
 		reindexed[file] = struct{}{}
 	}
 
-	patchDocs := make(map[string]types.DocumentData)
+	patchDocs := make(map[string]lsifstore.DocumentData)
 	for keyedDocument := range patch.Documents {
 		patchDocs[keyedDocument.Path] = keyedDocument.Document
 	}
 
-	patchChunks := make(map[int]types.ResultChunkData)
+	patchChunks := make(map[int]lsifstore.ResultChunkData)
 	for indexedChunk := range patch.ResultChunks {
 		patchChunks[indexedChunk.Index] = indexedChunk.ResultChunk
 	}
 
-	basePathList, err := base.PathsWithPrefix(ctx, "")
-	baseMeta, err := base.ReadMeta(ctx)
+	basePathList, err := lsifStore.PathsWithPrefix(ctx, baseBundleID, "")
+	baseMeta, err := lsifStore.ReadMeta(ctx, baseBundleID)
 
 	log15.Warn("loading base documents...")
-	baseDocs := make(map[string]types.DocumentData)
+	baseDocs := make(map[string]lsifstore.DocumentData)
 	for _, path := range basePathList {
-		document, _, _ := base.ReadDocument(ctx, path)
+		document, _, _ := lsifStore.ReadDocument(ctx, baseBundleID, path)
 		baseDocs[path] = document
 	}
 
 	log15.Warn("loading base result chunks...")
-	baseChunks := make(map[int]types.ResultChunkData)
+	baseChunks := make(map[int]lsifstore.ResultChunkData)
 	for id := 0; id < baseMeta.NumResultChunks; id++ {
-		resultChunk, _, _ := base.ReadResultChunk(ctx, id)
+		resultChunk, _, _ := lsifStore.ReadResultChunk(ctx, baseBundleID, id)
 		baseChunks[id] = resultChunk
 	}
 
@@ -366,7 +335,7 @@ func patchData(ctx context.Context, base persistence.Store, patch *correlation.G
 	unifyRangeIDs(baseDocs, patch.Meta, patchDocs, patchChunks, fileStatus)
 
 	log15.Warn("indexing new data...")
-	defResultsByPath := make(map[string]map[types.ID]types.RangeData)
+	defResultsByPath := make(map[string]map[lsifstore.ID]lsifstore.RangeData)
 
 	for path := range pathsToCopy {
 		log15.Warn(fmt.Sprintf("finding all def results referenced in %v", path))
@@ -380,7 +349,7 @@ func patchData(ctx context.Context, base persistence.Store, patch *correlation.G
 				def := patchDocs[defPath].Ranges[defLoc.RangeID]
 				defResults, exists := defResultsByPath[defPath]
 				if !exists {
-					defResults = make(map[types.ID]types.RangeData)
+					defResults = make(map[lsifstore.ID]lsifstore.RangeData)
 					defResultsByPath[defPath] = defResults
 				}
 				if _, exists := defResults[defLoc.RangeID]; !exists {
@@ -400,7 +369,7 @@ func patchData(ctx context.Context, base persistence.Store, patch *correlation.G
 			if doLog {
 				log15.Warn(fmt.Sprintf("unifying def result defined in %v:%v:%v)", def.StartLine, def.StartCharacter, path))
 			}
-			var defID, refID types.ID
+			var defID, refID lsifstore.ID
 			if fileStatus[path] == gitserver.Unchanged {
 				baseRng := baseDoc.Ranges[defRngID]
 
@@ -429,11 +398,11 @@ func patchData(ctx context.Context, base persistence.Store, patch *correlation.G
 			baseRefs, baseRefChunk := getDefRef(refID, baseMeta, baseChunks)
 			baseDefs, baseDefChunk := getDefRef(defID, baseMeta, baseChunks)
 
-			baseRefDocumentIDs := make(map[string]types.ID)
+			baseRefDocumentIDs := make(map[string]lsifstore.ID)
 			for id, path := range baseRefChunk.DocumentPaths {
 				baseRefDocumentIDs[path] = id
 			}
-			baseDefDocumentIDs := make(map[string]types.ID)
+			baseDefDocumentIDs := make(map[string]lsifstore.ID)
 			for id, path := range baseDefChunk.DocumentPaths {
 				baseDefDocumentIDs[path] = id
 			}
@@ -462,7 +431,7 @@ func patchData(ctx context.Context, base persistence.Store, patch *correlation.G
 				}
 
 				if len(baseDefs) == 0 {
-					var patchDef *types.DocumentIDRangeID
+					var patchDef *lsifstore.DocumentIDRangeID
 					for _, tmpDef := range patchDefs {
 						patchDefPath := patchDefChunk.DocumentPaths[tmpDef.DocumentID]
 						if patchDefPath == patchPath && tmpDef.RangeID == patchRef.RangeID {
@@ -492,7 +461,7 @@ func patchData(ctx context.Context, base persistence.Store, patch *correlation.G
 					if doLog {
 						log15.Warn(fmt.Sprintf("updating result ID"))
 					}
-					patchDocs[patchPath].Ranges[patchRef.RangeID] = types.RangeData{
+					patchDocs[patchPath].Ranges[patchRef.RangeID] = lsifstore.RangeData{
 						StartLine:          rng.StartLine,
 						StartCharacter:     rng.StartCharacter,
 						EndLine:            rng.EndLine,
@@ -526,12 +495,12 @@ func patchData(ctx context.Context, base persistence.Store, patch *correlation.G
 	}
 
 	log15.Warn("writing data...")
-	documentChan := make(chan persistence.KeyedDocumentData, len(baseDocs))
+	documentChan := make(chan lsifstore.KeyedDocumentData, len(baseDocs))
 	go func() {
 		defer close(documentChan)
 		for path, doc := range baseDocs {
 			select {
-			case documentChan <- persistence.KeyedDocumentData{
+			case documentChan <- lsifstore.KeyedDocumentData{
 				Path:     path,
 				Document: doc,
 			}:
@@ -540,13 +509,13 @@ func patchData(ctx context.Context, base persistence.Store, patch *correlation.G
 			}
 		}
 	}()
-	resultChunkChan := make(chan persistence.IndexedResultChunkData, len(baseChunks))
+	resultChunkChan := make(chan lsifstore.IndexedResultChunkData, len(baseChunks))
 	go func() {
 		defer close(resultChunkChan)
 
 		for idx, chunk := range baseChunks {
 			select {
-			case resultChunkChan <- persistence.IndexedResultChunkData{
+			case resultChunkChan <- lsifstore.IndexedResultChunkData{
 				Index:       idx,
 				ResultChunk: chunk,
 			}:
@@ -570,8 +539,8 @@ func patchData(ctx context.Context, base persistence.Store, patch *correlation.G
 	return
 }
 
-func removeRefsIn(paths map[string]struct{}, meta types.MetaData, docs map[string]types.DocumentData, chunks map[int]types.ResultChunkData) {
-	deletedRefs := make(map[types.ID]struct{})
+func removeRefsIn(paths map[string]struct{}, meta lsifstore.MetaData, docs map[string]lsifstore.DocumentData, chunks map[int]lsifstore.ResultChunkData) {
+	deletedRefs := make(map[lsifstore.ID]struct{})
 
 	for path := range paths {
 		doc := docs[path]
@@ -581,7 +550,7 @@ func removeRefsIn(paths map[string]struct{}, meta types.MetaData, docs map[strin
 			}
 
 			refs, refChunk := getDefRef(rng.ReferenceResultID, meta, chunks)
-			var filteredRefs []types.DocumentIDRangeID
+			var filteredRefs []lsifstore.DocumentIDRangeID
 			for _, ref := range refs {
 				refPath := refChunk.DocumentPaths[ref.DocumentID]
 				if _, exists := paths[refPath]; !exists {
@@ -596,12 +565,12 @@ func removeRefsIn(paths map[string]struct{}, meta types.MetaData, docs map[strin
 
 var unequalUnmodifiedPathsErr = errors.New("The ranges of unmodified path in LSIF patch do not match ranges of the same path in the base LSIF dump.")
 
-func unifyRangeIDs(updateToDocs map[string]types.DocumentData, toUpdateMeta types.MetaData, toUpdateDocs map[string]types.DocumentData, toUpdateChunks map[int]types.ResultChunkData, fileStatus map[string]gitserver.Status) error {
-	updatedRngIDs := make(map[types.ID]types.ID)
-	resultsToUpdate := make(map[types.ID]struct{})
+func unifyRangeIDs(updateToDocs map[string]lsifstore.DocumentData, toUpdateMeta lsifstore.MetaData, toUpdateDocs map[string]lsifstore.DocumentData, toUpdateChunks map[int]lsifstore.ResultChunkData, fileStatus map[string]gitserver.Status) error {
+	updatedRngIDs := make(map[lsifstore.ID]lsifstore.ID)
+	resultsToUpdate := make(map[lsifstore.ID]struct{})
 
 	for path, toUpdateDoc := range toUpdateDocs {
-		pathUpdatedRngIDs := make(map[types.ID]types.ID)
+		pathUpdatedRngIDs := make(map[lsifstore.ID]lsifstore.ID)
 		if fileStatus[path] == gitserver.Unchanged {
 			updateToDoc := updateToDocs[path]
 
@@ -616,7 +585,7 @@ func unifyRangeIDs(updateToDocs map[string]types.DocumentData, toUpdateMeta type
 				toUpdateRngID := toUpdateRng[idx]
 				toUpdateRng := toUpdateDoc.Ranges[toUpdateRngID]
 
-				if util.CompareRanges(updateToRng, toUpdateRng) != 0 {
+				if lsifstore.CompareRanges(updateToRng, toUpdateRng) != 0 {
 					return unequalUnmodifiedPathsErr
 				}
 
@@ -643,16 +612,16 @@ func unifyRangeIDs(updateToDocs map[string]types.DocumentData, toUpdateMeta type
 
 	for resultID := range resultsToUpdate {
 		results, chunk := getDefRef(resultID, toUpdateMeta, toUpdateChunks)
-		var updated []types.DocumentIDRangeID
+		var updated []lsifstore.DocumentIDRangeID
 		for _, result := range results {
 			if updatedID, exists := updatedRngIDs[result.RangeID]; exists {
-				updated = append(updated, types.DocumentIDRangeID{
-					RangeID: updatedID,
+				updated = append(updated, lsifstore.DocumentIDRangeID{
+					RangeID:    updatedID,
 					DocumentID: result.DocumentID,
 				})
 			} else {
-				updated = append(updated, types.DocumentIDRangeID{
-					RangeID: result.RangeID,
+				updated = append(updated, lsifstore.DocumentIDRangeID{
+					RangeID:    result.RangeID,
 					DocumentID: result.DocumentID,
 				})
 			}
@@ -663,41 +632,30 @@ func unifyRangeIDs(updateToDocs map[string]types.DocumentData, toUpdateMeta type
 	return nil
 }
 
-func sortedRangeIDs(ranges map[types.ID]types.RangeData) []types.ID {
-	var rngIDs []types.ID
+func sortedRangeIDs(ranges map[lsifstore.ID]lsifstore.RangeData) []lsifstore.ID {
+	var rngIDs []lsifstore.ID
 	for rngID := range ranges {
 		rngIDs = append(rngIDs, rngID)
 	}
 
 	sort.Slice(rngIDs, func(i, j int) bool {
-		return util.CompareRanges(ranges[rngIDs[i]], ranges[rngIDs[j]]) < 0
+		return lsifstore.CompareRanges(ranges[rngIDs[i]], ranges[rngIDs[j]]) < 0
 	})
 
 	return rngIDs
 }
 
-func getDefRef(resultID types.ID, meta types.MetaData, resultChunks map[int]types.ResultChunkData) ([]types.DocumentIDRangeID, types.ResultChunkData) {
-	chunkID := types.HashKey(resultID, meta.NumResultChunks)
+func getDefRef(resultID lsifstore.ID, meta lsifstore.MetaData, resultChunks map[int]lsifstore.ResultChunkData) ([]lsifstore.DocumentIDRangeID, lsifstore.ResultChunkData) {
+	chunkID := lsifstore.HashKey(resultID, meta.NumResultChunks)
 	chunk := resultChunks[chunkID]
 	docRngIDs := chunk.DocumentIDRangeIDs[resultID]
 	return docRngIDs, chunk
 }
 
-func newID() (types.ID, error) {
+func newID() (lsifstore.ID, error) {
 	uuid, err := uuid.NewRandom()
 	if err != nil {
 		return "", err
 	}
-	return types.ID(uuid.String()), nil
-}
-
-func (h *handler) sendDB(ctx context.Context, uploadID int, tempDir string) (err error) {
-	ctx, endOperation := h.metrics.SendDBOperation.With(ctx, &err, observation.Args{})
-	defer endOperation(1, observation.Args{})
-
-	if err := h.bundleManagerClient.SendDB(ctx, uploadID, tempDir); err != nil {
-		return errors.Wrap(err, "bundleManager.SendDB")
-	}
-
-	return nil
+	return lsifstore.ID(uuid.String()), nil
 }

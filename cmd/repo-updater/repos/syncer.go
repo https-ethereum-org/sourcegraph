@@ -16,6 +16,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sourcegraph/sourcegraph/internal/api"
+	"github.com/sourcegraph/sourcegraph/internal/conf"
 	"github.com/sourcegraph/sourcegraph/internal/trace"
 	"github.com/sourcegraph/sourcegraph/internal/workerutil"
 	dbworkerstore "github.com/sourcegraph/sourcegraph/internal/workerutil/dbworker/store"
@@ -63,7 +64,7 @@ type Syncer struct {
 type RunOptions struct {
 	EnqueueInterval func() time.Duration // Defaults to 1 minute
 	IsCloud         bool                 // Defaults to false
-	MinSyncInterval time.Duration        // Defaults to 1 minute
+	MinSyncInterval func() time.Duration // Defaults to 1 minute
 	DequeueInterval time.Duration        // Default to 10 seconds
 }
 
@@ -72,8 +73,8 @@ func (s *Syncer) Run(pctx context.Context, db *sql.DB, store Store, opts RunOpti
 	if opts.EnqueueInterval == nil {
 		opts.EnqueueInterval = func() time.Duration { return time.Minute }
 	}
-	if opts.MinSyncInterval == 0 {
-		opts.MinSyncInterval = time.Minute
+	if opts.MinSyncInterval == nil {
+		opts.MinSyncInterval = func() time.Duration { return time.Minute }
 	}
 	if opts.DequeueInterval == 0 {
 		opts.DequeueInterval = 10 * time.Second
@@ -120,7 +121,7 @@ type syncHandler struct {
 	db              *sql.DB
 	syncer          *Syncer
 	store           Store
-	minSyncInterval time.Duration
+	minSyncInterval func() time.Duration
 }
 
 func (s *syncHandler) Handle(ctx context.Context, tx dbworkerstore.Store, record workerutil.Record) (err error) {
@@ -134,7 +135,7 @@ func (s *syncHandler) Handle(ctx context.Context, tx dbworkerstore.Store, record
 		store = ws.With(tx.Handle().DB())
 	}
 
-	return s.syncer.SyncExternalService(ctx, store, sj.ExternalServiceID, s.minSyncInterval)
+	return s.syncer.SyncExternalService(ctx, store, sj.ExternalServiceID, s.minSyncInterval())
 }
 
 // contextWithSignalCancel will return a context which will be cancelled if
@@ -236,8 +237,8 @@ func (s *Syncer) SyncExternalService(ctx context.Context, tx Store, externalServ
 		return errors.Wrap(err, "syncer.sync.sourced")
 	}
 
-	// User added external services should only sync public code
-	if isUserOwned {
+	// Unless explicitly specified with "all", user added external services should only sync public code
+	if isUserOwned && conf.ExternalServiceUserMode() != conf.ExternalServiceModeAll {
 		sourced = sourced.Filter(func(r *Repo) bool { return !r.Private })
 	}
 
@@ -433,7 +434,7 @@ func (s *Syncer) SyncRepo(ctx context.Context, store Store, sourcedRepo *Repo) (
 		if txs, err = tr.Transact(ctx); err != nil {
 			return errors.Wrap(err, "Syncer.SyncRepo.transact")
 		}
-		defer txs.Done(&err)
+		defer txs.Done(err)
 		store = txs
 	}
 

@@ -17,6 +17,43 @@ schema {
 }
 
 """
+This type is not returned by any resolver, but serves to document what an error
+response will look like.
+"""
+type Error {
+    """
+    A string giving more context about the error that ocurred.
+    """
+    message: String!
+    """
+    The GraphQL path to where the error happened. For an error in the query
+    query {
+        user {
+            externalID # This is a nullable field that failed computing.
+        }
+    }
+    the path would be ["user", "externalID"].
+    """
+    path: [String!]!
+    """
+    Optional additional context on the error.
+    """
+    extensions: ErrorExtensions
+}
+
+"""
+Optional additional context on an error returned from a resolver.
+It may also contain more properties, which aren't strictly typed here.
+"""
+type ErrorExtensions {
+    """
+    An error code, which can be asserted on.
+    Possible error codes are communicated in the doc string of the field.
+    """
+    code: String
+}
+
+"""
 Represents a null return value.
 """
 type EmptyResponse {
@@ -55,7 +92,7 @@ type Mutation {
 
     Only the user and site admins may perform this mutation.
     """
-    updateUser(user: ID!, username: String, displayName: String, avatarURL: String): EmptyResponse!
+    updateUser(user: ID!, username: String, displayName: String, avatarURL: String): User!
     """
     Creates an organization. The caller is added as a member of the newly created organization.
 
@@ -159,6 +196,12 @@ type Mutation {
     Only the user and site admins may perform this mutation.
     """
     removeUserEmail(user: ID!, email: String!): EmptyResponse!
+    """
+    Set an email address as the user's primary.
+
+    Only the user and site admins may perform this mutation.
+    """
+    setUserEmailPrimary(user: ID!, email: String!): EmptyResponse!
     """
     Manually set the verification status of a user's email, without going through the normal verification process
     (of clicking on a link in the email with a verification code).
@@ -548,11 +591,10 @@ type Mutation {
     scheduleUserPermissionsSync(user: ID!): EmptyResponse!
 
     """
-    CAMPAIGNS
-
-    Create a campaign from a campaign spec and locally computed changeset specs. If a campaign in
-    the same namespace with the same name already exists, an error is returned. The newly created
+    Create a campaign from a campaign spec and locally computed changeset specs. The newly created
     campaign is returned.
+    If a campaign in the same namespace with the same name already exists, an error with the error code
+    ErrMatchingCampaignExists is returned.
     """
     createCampaign(
         """
@@ -565,6 +607,8 @@ type Mutation {
     Create or update a campaign from a campaign spec and locally computed changeset specs. If no
     campaign exists in the namespace with the name given in the campaign spec, a campaign will be
     created. Otherwise, the existing campaign will be updated. The campaign is returned.
+    Closed campaigns cannot be applied to. In that case, an error with the error code ErrApplyClosedCampaign
+    will be returned.
     """
     applyCampaign(
         """
@@ -577,7 +621,7 @@ type Mutation {
         parameters does not match the campaign with this ID. This lets callers use a stable ID
         that refers to a specific campaign during an edit session (and is not susceptible to
         conflicts if the underlying campaign is moved to a different namespace, renamed, or
-        deleted).
+        deleted). The returned error has the error code ErrEnsureCampaignFailed.
         """
         ensureCampaign: ID
     ): Campaign!
@@ -663,6 +707,33 @@ type Mutation {
     syncChangeset(changeset: ID!): EmptyResponse!
 
     """
+    Create a new credential for the requesting user for the given code host.
+    If another token for that code host already exists, an error with the error code
+    ErrDuplicateCredential is returned.
+    """
+    createCampaignsCredential(
+        """
+        The kind of external service being configured.
+        """
+        externalServiceKind: ExternalServiceKind!
+
+        """
+        The URL of the external service being configured.
+        """
+        externalServiceURL: String!
+
+        """
+        The credential to be stored. This can never be retrieved through the API and will be stored encrypted.
+        """
+        credential: String!
+    ): CampaignsCredential!
+
+    """
+    Hard-deletes a given campaigns credential.
+    """
+    deleteCampaignsCredential(campaignsCredential: ID!): EmptyResponse!
+
+    """
     OBSERVABILITY
 
     Set the status of a test alert of the specified parameters - useful for validating
@@ -674,6 +745,141 @@ type Mutation {
         """
         level: String!
     ): EmptyResponse!
+    """
+    Create a code monitor.
+    """
+    createCodeMonitor(
+        """
+        The namespace represents the owner of the code monitor.
+        Owners can either be users or organizations.
+        """
+        namespace: ID!
+        """
+        A meaningful description of the code monitor.
+        """
+        description: String!
+        """
+        Whether the code monitor is enabled or not.
+        """
+        enabled: Boolean!
+        """
+        A trigger.
+        """
+        trigger: MonitorTriggerInput!
+        """
+        A list of actions.
+        """
+        actions: [MonitorActionInput!]!
+    ): Monitor!
+    """
+    Set a code monitor to active/inactive.
+    """
+    toggleCodeMonitor(
+        """
+        The id of a code monitor.
+        """
+        id: ID!
+        """
+        Whether the code monitor should be enabled or not.
+        """
+        enabled: Boolean!
+    ): Monitor!
+    """
+    Delete a code monitor.
+    """
+    deleteCodeMonitor(
+        """
+        The id of a code monitor.
+        """
+        id: ID!
+    ): EmptyResponse!
+    """
+    Update a code monitor. Objects in the db will be overwritten with the objects in the request. Objects
+    which are not contained in the request remain unchanged. If the request contains objects that have
+    no corresponding entry in the db, an error is returned.
+    """
+    updateCodeMonitor(
+        """
+        The input required to edit a monitor.
+        """
+        monitor: MonitorEditInput!
+        """
+        The input required to edit the trigger of a monitor. You can only edit triggers that are
+        associated with the monitor (value of field monitor).
+        """
+        trigger: MonitorEditTriggerInput!
+        """
+        The input required to edit the actions of a monitor. You can only edit actions that are
+        associated with the monitor (value of field monitor).
+        """
+        actions: [MonitorEditActionInput!]!
+    ): Monitor!
+}
+
+"""
+A connection of all code hosts usable with campaigns and accessible by the user
+this is requested on.
+"""
+type CampaignsCodeHostConnection {
+    """
+    A list of code hosts.
+    """
+    nodes: [CampaignsCodeHost!]!
+
+    """
+    The total number of configured external services in the connection.
+    """
+    totalCount: Int!
+
+    """
+    Pagination information.
+    """
+    pageInfo: PageInfo!
+}
+
+"""
+A code host usable with campaigns. This service is accessible by the user it belongs to.
+"""
+type CampaignsCodeHost {
+    """
+    The kind of external service.
+    """
+    externalServiceKind: ExternalServiceKind!
+
+    """
+    The URL of the external service.
+    """
+    externalServiceURL: String!
+
+    """
+    The configured credential, if any.
+    """
+    credential: CampaignsCredential
+}
+
+"""
+A user token configured for campaigns use on the specified code host.
+"""
+type CampaignsCredential implements Node {
+    """
+    A globally unique identifier.
+    """
+    id: ID!
+
+    """
+    The kind of external service.
+    """
+    externalServiceKind: ExternalServiceKind!
+
+    """
+    The URL of the external service.
+    """
+    externalServiceURL: String!
+
+    """
+    The date and time this token has been created at.
+    """
+    createdAt: DateTime!
 }
 
 """
@@ -1028,6 +1234,24 @@ type CampaignSpec implements Node {
     campaign doesn't yet exist.
     """
     appliesToCampaign: Campaign
+
+    """
+    The code host connections required for applying this spec. Includes the credentials of the current user.
+    """
+    viewerCampaignsCodeHosts(
+        """
+        Returns the first n code hosts from the list.
+        """
+        first: Int = 50
+        """
+        Opaque pagination cursor.
+        """
+        after: String
+        """
+        Only returns the code hosts for which the viewer doesn't have credentials.
+        """
+        onlyWithoutCredential: Boolean = false
+    ): CampaignsCodeHostConnection!
 }
 
 """
@@ -1118,6 +1342,11 @@ type Campaign implements Node {
     closedAt: DateTime
 
     """
+    Stats on all the changesets that are tracked in this campaign.
+    """
+    changesetsStats: ChangesetsStats!
+
+    """
     The changesets in this campaign that already exist on the code host.
     """
     changesets(
@@ -1199,6 +1428,10 @@ type ChangesetCounts {
     The number of closed changesets.
     """
     closed: Int!
+    """
+    The number of draft changesets (independent of review state).
+    """
+    draft: Int!
     """
     The number of open changesets (independent of review state).
     """
@@ -1283,6 +1516,7 @@ enum ChangesetReconcilerState {
 The state of a changeset on the code host on which it's hosted.
 """
 enum ChangesetExternalState {
+    DRAFT
     OPEN
     CLOSED
     MERGED
@@ -1588,11 +1822,15 @@ type ExternalChangeset implements Node & Changeset {
 """
 Used in the campaign page for the overview component.
 """
-type ChangesetConnectionStats {
+type ChangesetsStats {
     """
     The count of unpublished changesets.
     """
     unpublished: Int!
+    """
+    The count of externalState: DRAFT changesets.
+    """
+    draft: Int!
     """
     The count of externalState: OPEN changesets.
     """
@@ -1610,7 +1848,7 @@ type ChangesetConnectionStats {
     """
     deleted: Int!
     """
-    The count of all changesets. Equal to totalCount of the connection.
+    The count of all changesets.
     """
     total: Int!
 }
@@ -1633,11 +1871,6 @@ type ChangesetConnection {
     Pagination information.
     """
     pageInfo: PageInfo!
-
-    """
-    Stats on all the changesets that are in this connection. Pagination has no effect on the stats.
-    """
-    stats: ChangesetConnectionStats!
 }
 
 """
@@ -2790,6 +3023,418 @@ type SavedSearch implements Node {
     The Slack webhook URL associated with this saved search, if any.
     """
     slackWebhookURL: String
+}
+
+"""
+A list of code monitors
+"""
+type MonitorConnection {
+    """
+    A list of monitors.
+    """
+    nodes: [Monitor!]!
+
+    """
+    The total number of monitors in the connection.
+    """
+    totalCount: Int!
+
+    """
+    Pagination information.
+    """
+    pageInfo: PageInfo!
+}
+
+"""
+A code monitor with one trigger and possibly many actions.
+"""
+type Monitor implements Node {
+    """
+    The code monitor's unique ID.
+    """
+    id: ID!
+    """
+    The user who created the code monitor.
+    """
+    createdBy: User!
+    """
+    The time at which the code monitor was created.
+    """
+    createdAt: DateTime!
+    """
+    A meaningful description of the code monitor.
+    """
+    description: String!
+    """
+    Owners can edit the code monitor.
+    """
+    owner: Namespace!
+    """
+    Whether the code monitor is currently enabled.
+    """
+    enabled: Boolean!
+    """
+    Triggers trigger actions. There can only be one trigger per monitor.
+    """
+    trigger: MonitorTrigger
+    """
+    One or more actions that are triggered by the trigger.
+    """
+    actions(
+        """
+        Returns the first n actions from the list.
+        """
+        first: Int = 50
+        """
+        Opaque pagination cursor.
+        """
+        after: String
+    ): MonitorActionConnection!
+}
+
+"""
+A query that can serve as a trigger for code monitors.
+"""
+type MonitorQuery implements Node {
+    """
+    The unique id of a trigger query.
+    """
+    id: ID!
+    """
+    A query.
+    """
+    query: String!
+    """
+    A list of events.
+    """
+    events(
+        """
+        Returns the first n events from the list.
+        """
+        first: Int = 50
+        """
+        Opaque pagination cursor.
+        """
+        after: String
+    ): MonitorTriggerEventConnection!
+}
+
+"""
+A list of trigger events.
+"""
+type MonitorTriggerEventConnection {
+    """
+    A list of events.
+    """
+    nodes: [MonitorTriggerEvent!]!
+    """
+    The total number of events in the connection.
+    """
+    totalCount: Int!
+    """
+    Pagination information.
+    """
+    pageInfo: PageInfo!
+}
+
+"""
+A trigger event is an event together with a list of associated actions.
+"""
+type MonitorTriggerEvent implements Node {
+    """
+    The unique id of an event.
+    """
+    id: ID!
+    """
+    The status of an event.
+    """
+    status: EventStatus!
+    """
+    A message with details regarding the status of the event.
+    """
+    message: String
+    """
+    The time and date of the event.
+    """
+    timestamp: DateTime!
+    """
+    A list of actions.
+    """
+    actions(
+        """
+        Returns the first n events from the list.
+        """
+        first: Int = 50
+        """
+        Opaque pagination cursor.
+        """
+        after: String
+    ): MonitorActionConnection!
+}
+
+"""
+Supported triggers for code monitors.
+"""
+union MonitorTrigger = MonitorQuery
+
+"""
+A list of actions.
+"""
+type MonitorActionConnection {
+    """
+    A list of actions.
+    """
+    nodes: [MonitorAction!]!
+
+    """
+    The total number of actions in the connection.
+    """
+    totalCount: Int!
+
+    """
+    Pagination information.
+    """
+    pageInfo: PageInfo!
+}
+
+"""
+Supported actions for code monitors.
+"""
+union MonitorAction = MonitorEmail
+
+"""
+Email is one of the supported actions of code monitors.
+"""
+type MonitorEmail implements Node {
+    """
+    The unique id of an email action.
+    """
+    id: ID!
+    """
+    Whether the email action is enabled or not.
+    """
+    enabled: Boolean!
+    """
+    The priority of the email action.
+    """
+    priority: MonitorEmailPriority!
+    """
+    Use header to automatically approve the message in a read-only or moderated mailing list.
+    """
+    header: String!
+    """
+    A list of recipients of the email.
+    """
+    recipients(
+        """
+        Returns the first n recipients from the list.
+        """
+        first: Int = 50
+        """
+        Opaque pagination cursor.
+        """
+        after: String
+    ): MonitorActionEmailRecipientsConnection!
+    """
+    A list of events.
+    """
+    events(
+        """
+        Returns the first n events from the list.
+        """
+        first: Int = 50
+        """
+        Opaque pagination cursor.
+        """
+        after: String
+    ): MonitorActionEventConnection!
+}
+
+"""
+The priority of an email action.
+"""
+enum MonitorEmailPriority {
+    NORMAL
+    CRITICAL
+}
+
+"""
+A list of events.
+"""
+type MonitorActionEmailRecipientsConnection {
+    """
+    A list of recipients.
+    """
+    nodes: [Namespace!]!
+    """
+    The total number of recipients in the connection.
+    """
+    totalCount: Int!
+    """
+    Pagination information.
+    """
+    pageInfo: PageInfo!
+}
+
+"""
+A list of events.
+"""
+type MonitorActionEventConnection {
+    """
+    A list of events.
+    """
+    nodes: [MonitorActionEvent!]!
+    """
+    The total number of events in the connection.
+    """
+    totalCount: Int!
+    """
+    Pagination information.
+    """
+    pageInfo: PageInfo!
+}
+
+"""
+An event documents the result of a trigger or an execution of an action.
+"""
+type MonitorActionEvent implements Node {
+    """
+    The unique id of an event.
+    """
+    id: ID!
+    """
+    The status of an event.
+    """
+    status: EventStatus!
+    """
+    A message with details regarding the status of the event.
+    """
+    message: String
+    """
+    The time and date of the event.
+    """
+    timestamp: DateTime!
+}
+
+"""
+Supported status of monitor events.
+"""
+enum EventStatus {
+    PENDING
+    SUCCESS
+    ERROR
+}
+
+"""
+The input required to create a code monitor.
+"""
+input MonitorInput {
+    """
+    The namespace represents the owner of the code monitor.
+    Owners can either be users or organizations.
+    """
+    namespace: ID!
+    """
+    A meaningful description of the code monitor.
+    """
+    description: String!
+    """
+    Whether the code monitor is enabled or not.
+    """
+    enabled: Boolean!
+}
+
+"""
+The input required to edit a code monitor.
+"""
+input MonitorEditInput {
+    """
+    The id of the monitor.
+    """
+    id: ID!
+    """
+    The desired state after the udpate.
+    """
+    update: MonitorInput!
+}
+
+"""
+The input required to create a trigger.
+"""
+input MonitorTriggerInput {
+    """
+    The query string.
+    """
+    query: String!
+}
+
+"""
+The input required to edit a trigger.
+"""
+input MonitorEditTriggerInput {
+    """
+    The id of the Trigger.
+    """
+    id: ID!
+    """
+    The desired state after the udpate.
+    """
+    update: MonitorTriggerInput!
+}
+
+"""
+The input required to create an action.
+"""
+input MonitorActionInput {
+    """
+    An email action.
+    """
+    email: MonitorEmailInput
+}
+
+"""
+The input required to create an email action.
+"""
+input MonitorEmailInput {
+    """
+    Whether the email action is enabled or not.
+    """
+    enabled: Boolean!
+    """
+    The priority of the email.
+    """
+    priority: MonitorEmailPriority!
+    """
+    A list of users or orgs which will receive the email.
+    """
+    recipients: [ID!]!
+    """
+    Use header to automatically approve the message in a read-only or moderated mailing list.
+    """
+    header: String!
+}
+"""
+The input required to edit an action.
+"""
+input MonitorEditActionInput {
+    """
+    An email action.
+    """
+    email: MonitorEditEmailInput
+}
+
+"""
+The input required to edit an email action.
+"""
+input MonitorEditEmailInput {
+    """
+    The id of an email action.
+    """
+    id: ID!
+    """
+    The desired state after the update.
+    """
+    update: MonitorEmailInput!
 }
 
 """
@@ -5518,6 +6163,36 @@ type User implements Node & SettingsSubject & Namespace {
         """
         viewerCanAdminister: Boolean
     ): CampaignConnection!
+
+    """
+    Returns a connection of configured external services accessible by this user, for usage with campaigns.
+    These are all code hosts configured on the Sourcegraph instance that are supported by campaigns. They are
+    connected to CampaignCredential resources, if one has been created for the code host connection before.
+    """
+    campaignsCodeHosts(
+        """
+        Returns the first n code hosts from the list.
+        """
+        first: Int = 50
+        """
+        Opaque pagination cursor.
+        """
+        after: String
+    ): CampaignsCodeHostConnection!
+
+    """
+    A list of monitors owned by the user or her organization.
+    """
+    monitors(
+        """
+        Returns the first n monitors from the list.
+        """
+        first: Int = 50
+        """
+        Opaque pagination cursor.
+        """
+        after: String
+    ): MonitorConnection!
 }
 
 """
@@ -7215,9 +7890,59 @@ type LSIFIndex implements Node {
     failure: String
 
     """
+    A series of pre-indexing steps to perform.
+    """
+    dockerSteps: [DockerStep!]!
+
+    """
+    The original root supplied at index schedule time.
+    """
+    inputRoot: String!
+
+    """
+    The name of the target indexer Docker image (e.g., sourcegraph/lsif-go@sha256:...).
+    """
+    indexer: String!
+
+    """
+    The arguments to supply to the indexer container.
+    """
+    indexerArgs: [String!]!
+
+    """
+    The path to the index file relative to the root directory (dump.lsif by default).
+    """
+    outfile: String
+
+    """
+    The output of the configured docker step, indexer, and src-cli invocations.
+    """
+    logContents: String
+
+    """
     The rank of this index in the queue. The value of this field is null if the index has been processed.
     """
     placeInQueue: Int
+}
+
+"""
+A description of a command to run inside of a Docker container.
+"""
+type DockerStep {
+    """
+    The working directory relative to the cloned repository root.
+    """
+    root: String!
+
+    """
+    The name of the Docker image to run.
+    """
+    image: String!
+
+    """
+    The arguments to supply to the Docker container's entrypoint.
+    """
+    commands: [String!]!
 }
 
 """

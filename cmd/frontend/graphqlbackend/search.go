@@ -14,13 +14,13 @@ import (
 	"time"
 
 	"github.com/inconshreveable/log15"
-	otlog "github.com/opentracing/opentracing-go/log"
-
 	"github.com/neelance/parallel"
+	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/pkg/errors"
 
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/envvar"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
+	"github.com/sourcegraph/sourcegraph/internal/actor"
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/conf"
 	"github.com/sourcegraph/sourcegraph/internal/db"
@@ -288,6 +288,10 @@ type searchResolver struct {
 	userSettings        *schema.Settings
 	invalidateRepoCache bool // if true, invalidates the repo cache when evaluating search subexpressions.
 
+	// resultChannel if non-nil will send all results we receive down it. See
+	// searchResolver.SetResultChannel
+	resultChannel chan<- []SearchResultResolver
+
 	// Cached resolveRepositories results.
 	reposMu  sync.Mutex
 	resolved resolvedRepositories
@@ -295,6 +299,19 @@ type searchResolver struct {
 
 	zoekt        *searchbackend.Zoekt
 	searcherURLs *endpoint.Map
+}
+
+// SetResultChannel will send all results down c.
+//
+// This is how our streaming and our batch interface co-exist. When this is
+// set, it exposes a way to stream out results as we collect them.
+//
+// TODO(keegan) This is not our final design. For example this doesn't allow
+// us to stream out things like dynamic filters or take into account
+// AND/OR. However, streaming is behind a feature flag for now, so this is to
+// make it visible in the browser.
+func (r *searchResolver) SetResultChannel(c chan<- []SearchResultResolver) {
+	r.resultChannel = c
 }
 
 // rawQuery returns the original query string input.
@@ -379,7 +396,7 @@ func (r RepoRegexpPattern) String() string {
 
 var mockResolveRepoGroups func() (map[string][]RepoGroupValue, error)
 
-func resolveRepoGroups(settings *schema.Settings) (groups map[string][]RepoGroupValue, err error) {
+func resolveRepoGroups(ctx context.Context, settings *schema.Settings) (groups map[string][]RepoGroupValue, err error) {
 	if mockResolveRepoGroups != nil {
 		return mockResolveRepoGroups()
 	}
@@ -396,7 +413,7 @@ func resolveRepoGroups(settings *schema.Settings) (groups map[string][]RepoGroup
 				if stringRegex, ok := path["regex"].(string); ok {
 					repos = append(repos, RepoRegexpPattern(stringRegex))
 				} else {
-					log15.Warn("ignoring repo group value because regex not specfied", "regex-string", path["regex"])
+					log15.Warn("ignoring repo group value because regex not specified", "regex-string", path["regex"])
 				}
 			default:
 				log15.Warn("ignoring repo group value of unrecognized type", "value", value, "type", fmt.Sprintf("%T", value))
@@ -404,6 +421,28 @@ func resolveRepoGroups(settings *schema.Settings) (groups map[string][]RepoGroup
 		}
 		groups[name] = repos
 	}
+
+	if currentUserAllowedExternalServices(ctx) == conf.ExternalServiceModeDisabled {
+		return groups, nil
+	}
+
+	a := actor.FromContext(ctx)
+	names, err := db.Repos.GetUserAddedRepoNames(ctx, a.UID)
+	if err != nil {
+		log15.Warn("getting user added repos", "err", err)
+		return groups, nil
+	}
+
+	if len(names) == 0 {
+		return groups, nil
+	}
+
+	values := make([]RepoGroupValue, 0, len(names))
+	for _, name := range names {
+		values = append(values, RepoPath(name))
+	}
+	groups["my"] = values
+
 	return groups, nil
 }
 
@@ -822,7 +861,7 @@ func resolveRepositories(ctx context.Context, op resolveRepoOp) (resolvedReposit
 	// groups and the set of repos specified with repo:. (If none are specified
 	// with repo:, then include all from the group.)
 	if groupNames := op.repoGroupFilters; len(groupNames) > 0 {
-		groups, err := resolveRepoGroups(op.userSettings)
+		groups, err := resolveRepoGroups(ctx, op.userSettings)
 		if err != nil {
 			return resolvedRepositories{}, err
 		}

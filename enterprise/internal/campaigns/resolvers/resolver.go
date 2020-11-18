@@ -3,6 +3,7 @@ package resolvers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strconv"
 
@@ -17,13 +18,12 @@ import (
 	"github.com/sourcegraph/sourcegraph/internal/conf"
 	"github.com/sourcegraph/sourcegraph/internal/db"
 	"github.com/sourcegraph/sourcegraph/internal/errcode"
+	"github.com/sourcegraph/sourcegraph/internal/extsvc"
+	"github.com/sourcegraph/sourcegraph/internal/extsvc/auth"
 	"github.com/sourcegraph/sourcegraph/internal/httpcli"
 	"github.com/sourcegraph/sourcegraph/internal/trace"
+	"github.com/sourcegraph/sourcegraph/internal/usagestats"
 )
-
-var ErrIDIsZero = errors.New("invalid node id")
-var ErrCampaignsDisabled = errors.New("campaigns are disabled. Set 'campaigns.enabled' in the site configuration to enable the feature.")
-var ErrCampaignsDotCom = errors.New("access to campaigns on Sourcegraph.com is currently not available")
 
 // Resolver is the GraphQL resolver of all things related to Campaigns.
 type Resolver struct {
@@ -36,17 +36,20 @@ func NewResolver(db *sql.DB) graphqlbackend.CampaignsResolver {
 	return &Resolver{store: ee.NewStore(db)}
 }
 
-func campaignsEnabled() error {
+func campaignsEnabled(ctx context.Context) error {
 	// On Sourcegraph.com nobody can read/create campaign entities
 	if envvar.SourcegraphDotComMode() {
-		return ErrCampaignsDotCom
+		return ErrCampaignsDotCom{}
 	}
 
 	if enabled := conf.CampaignsEnabled(); enabled {
+		if conf.Get().CampaignsRestrictToAdmins && backend.CheckCurrentUserIsSiteAdmin(ctx) != nil {
+			return ErrCampaignsDisabledForUser{}
+		}
 		return nil
 	}
 
-	return ErrCampaignsDisabled
+	return ErrCampaignsDisabled{}
 }
 
 // campaignsCreateAccess returns true if the current user can create
@@ -54,15 +57,18 @@ func campaignsEnabled() error {
 func campaignsCreateAccess(ctx context.Context) error {
 	// On Sourcegraph.com nobody can create campaigns/patchsets/changesets
 	if envvar.SourcegraphDotComMode() {
-		return ErrCampaignsDotCom
+		return ErrCampaignsDotCom{}
 	}
 
-	// Only site-admins can create campaigns/patchsets/changesets
-	return backend.CheckCurrentUserIsSiteAdmin(ctx)
+	act := actor.FromContext(ctx)
+	if !act.IsAuthenticated() {
+		return backend.ErrNotAuthenticated
+	}
+	return nil
 }
 
 func (r *Resolver) ChangesetByID(ctx context.Context, id graphql.ID) (graphqlbackend.ChangesetResolver, error) {
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -94,7 +100,7 @@ func (r *Resolver) ChangesetByID(ctx context.Context, id graphql.ID) (graphqlbac
 }
 
 func (r *Resolver) CampaignByID(ctx context.Context, id graphql.ID) (graphqlbackend.CampaignResolver, error) {
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -119,7 +125,7 @@ func (r *Resolver) CampaignByID(ctx context.Context, id graphql.ID) (graphqlback
 }
 
 func (r *Resolver) Campaign(ctx context.Context, args *graphqlbackend.CampaignArgs) (graphqlbackend.CampaignResolver, error) {
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -142,7 +148,7 @@ func (r *Resolver) Campaign(ctx context.Context, args *graphqlbackend.CampaignAr
 }
 
 func (r *Resolver) CampaignSpecByID(ctx context.Context, id graphql.ID) (graphqlbackend.CampaignSpecResolver, error) {
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -168,7 +174,7 @@ func (r *Resolver) CampaignSpecByID(ctx context.Context, id graphql.ID) (graphql
 }
 
 func (r *Resolver) ChangesetSpecByID(ctx context.Context, id graphql.ID) (graphqlbackend.ChangesetSpecResolver, error) {
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -198,6 +204,31 @@ func (r *Resolver) ChangesetSpecByID(ctx context.Context, id graphql.ID) (graphq
 	}, nil
 }
 
+func (r *Resolver) CampaignsCredentialByID(ctx context.Context, id graphql.ID) (graphqlbackend.CampaignsCredentialResolver, error) {
+	if err := campaignsEnabled(ctx); err != nil {
+		return nil, err
+	}
+
+	dbID, err := unmarshalCampaignsCredentialID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	cred, err := db.UserCredentials.GetByID(ctx, dbID)
+	if err != nil {
+		if errcode.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if err := backend.CheckSiteAdminOrSameUser(ctx, cred.UserID); err != nil {
+		return nil, err
+	}
+
+	return &campaignsCredentialResolver{credential: cred}, nil
+}
+
 func (r *Resolver) CreateCampaign(ctx context.Context, args *graphqlbackend.CreateCampaignArgs) (graphqlbackend.CampaignResolver, error) {
 	var err error
 	tr, _ := trace.New(ctx, "Resolver.CreateCampaign", fmt.Sprintf("CampaignSpec %s", args.CampaignSpec))
@@ -206,7 +237,7 @@ func (r *Resolver) CreateCampaign(ctx context.Context, args *graphqlbackend.Crea
 		tr.Finish()
 	}()
 
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -221,12 +252,19 @@ func (r *Resolver) CreateCampaign(ctx context.Context, args *graphqlbackend.Crea
 	}
 
 	if opts.CampaignSpecRandID == "" {
-		return nil, ErrIDIsZero
+		return nil, ErrIDIsZero{}
 	}
 
 	svc := ee.NewService(r.store, r.httpFactory)
 	campaign, err := svc.ApplyCampaign(ctx, opts)
 	if err != nil {
+		if err == ee.ErrEnsureCampaignFailed {
+			return nil, ErrEnsureCampaignFailed{}
+		} else if err == ee.ErrApplyClosedCampaign {
+			return nil, ErrApplyClosedCampaign{}
+		} else if err == ee.ErrMatchingCampaignExists {
+			return nil, ErrMatchingCampaignExists{}
+		}
 		return nil, err
 	}
 
@@ -241,7 +279,7 @@ func (r *Resolver) ApplyCampaign(ctx context.Context, args *graphqlbackend.Apply
 		tr.Finish()
 	}()
 
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -253,7 +291,7 @@ func (r *Resolver) ApplyCampaign(ctx context.Context, args *graphqlbackend.Apply
 	}
 
 	if opts.CampaignSpecRandID == "" {
-		return nil, ErrIDIsZero
+		return nil, ErrIDIsZero{}
 	}
 
 	if args.EnsureCampaign != nil {
@@ -268,6 +306,13 @@ func (r *Resolver) ApplyCampaign(ctx context.Context, args *graphqlbackend.Apply
 	// apply the campaign spec
 	campaign, err := svc.ApplyCampaign(ctx, opts)
 	if err != nil {
+		if err == ee.ErrEnsureCampaignFailed {
+			return nil, ErrEnsureCampaignFailed{}
+		} else if err == ee.ErrApplyClosedCampaign {
+			return nil, ErrApplyClosedCampaign{}
+		} else if err == ee.ErrMatchingCampaignExists {
+			return nil, ErrMatchingCampaignExists{}
+		}
 		return nil, err
 	}
 
@@ -282,7 +327,7 @@ func (r *Resolver) CreateCampaignSpec(ctx context.Context, args *graphqlbackend.
 		tr.Finish()
 	}()
 
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -311,6 +356,10 @@ func (r *Resolver) CreateCampaignSpec(ctx context.Context, args *graphqlbackend.
 		return nil, err
 	}
 
+	if err := logCampaignSpecCreated(ctx, &opts); err != nil {
+		return nil, err
+	}
+
 	specResolver := &campaignSpecResolver{
 		store:        r.store,
 		httpFactory:  r.httpFactory,
@@ -318,6 +367,24 @@ func (r *Resolver) CreateCampaignSpec(ctx context.Context, args *graphqlbackend.
 	}
 
 	return specResolver, nil
+}
+
+func logCampaignSpecCreated(ctx context.Context, opts *ee.CreateCampaignSpecOpts) error {
+	// Log an analytics event when a CampaignSpec has been created.
+	// See internal/usagestats/campaigns.go.
+	actor := actor.FromContext(ctx)
+
+	type eventArg struct {
+		ChangesetSpecsCount int `json:"changeset_specs_count"`
+	}
+	arg := eventArg{ChangesetSpecsCount: len(opts.ChangesetSpecRandIDs)}
+
+	jsonArg, err := json.Marshal(arg)
+	if err != nil {
+		return err
+	}
+
+	return usagestats.LogBackendEvent(actor.UID, "CampaignSpecCreated", json.RawMessage(jsonArg))
 }
 
 func (r *Resolver) CreateChangesetSpec(ctx context.Context, args *graphqlbackend.CreateChangesetSpecArgs) (graphqlbackend.ChangesetSpecResolver, error) {
@@ -328,7 +395,7 @@ func (r *Resolver) CreateChangesetSpec(ctx context.Context, args *graphqlbackend
 		tr.Finish()
 	}()
 
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -364,7 +431,7 @@ func (r *Resolver) MoveCampaign(ctx context.Context, args *graphqlbackend.MoveCa
 		tr.Finish()
 	}()
 
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -374,7 +441,7 @@ func (r *Resolver) MoveCampaign(ctx context.Context, args *graphqlbackend.MoveCa
 	}
 
 	if campaignID == 0 {
-		return nil, ErrIDIsZero
+		return nil, ErrIDIsZero{}
 	}
 
 	var opts ee.MoveCampaignOpts
@@ -406,7 +473,7 @@ func (r *Resolver) DeleteCampaign(ctx context.Context, args *graphqlbackend.Dele
 		tr.SetError(err)
 		tr.Finish()
 	}()
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -416,7 +483,7 @@ func (r *Resolver) DeleteCampaign(ctx context.Context, args *graphqlbackend.Dele
 	}
 
 	if campaignID == 0 {
-		return nil, ErrIDIsZero
+		return nil, ErrIDIsZero{}
 	}
 
 	svc := ee.NewService(r.store, r.httpFactory)
@@ -426,7 +493,7 @@ func (r *Resolver) DeleteCampaign(ctx context.Context, args *graphqlbackend.Dele
 }
 
 func (r *Resolver) Campaigns(ctx context.Context, args *graphqlbackend.ListCampaignsArgs) (graphqlbackend.CampaignsConnectionResolver, error) {
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -473,6 +540,33 @@ func (r *Resolver) Campaigns(ctx context.Context, args *graphqlbackend.ListCampa
 		httpFactory: r.httpFactory,
 		opts:        opts,
 	}, nil
+}
+
+func (r *Resolver) CampaignsCodeHosts(ctx context.Context, args *graphqlbackend.ListCampaignsCodeHostsArgs) (graphqlbackend.CampaignsCodeHostConnectionResolver, error) {
+	if err := campaignsEnabled(ctx); err != nil {
+		return nil, err
+	}
+
+	// 🚨 SECURITY: Only viewable for self or by site admins.
+	if err := backend.CheckSiteAdminOrSameUser(ctx, args.UserID); err != nil {
+		return nil, err
+	}
+
+	if err := validateFirstParamDefaults(args.First); err != nil {
+		return nil, err
+	}
+	limitOffset := db.LimitOffset{
+		Limit: int(args.First),
+	}
+	if args.After != nil {
+		cursor, err := strconv.ParseInt(*args.After, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		limitOffset.Offset = int(cursor)
+	}
+
+	return &campaignsCodeHostConnectionResolver{userID: args.UserID, limitOffset: limitOffset, store: r.store}, nil
 }
 
 // listChangesetOptsFromArgs turns the graphqlbackend.ListChangesetsArgs into
@@ -565,7 +659,7 @@ func (r *Resolver) CloseCampaign(ctx context.Context, args *graphqlbackend.Close
 		tr.Finish()
 	}()
 
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -575,7 +669,7 @@ func (r *Resolver) CloseCampaign(ctx context.Context, args *graphqlbackend.Close
 	}
 
 	if campaignID == 0 {
-		return nil, ErrIDIsZero
+		return nil, ErrIDIsZero{}
 	}
 
 	svc := ee.NewService(r.store, r.httpFactory)
@@ -594,7 +688,7 @@ func (r *Resolver) SyncChangeset(ctx context.Context, args *graphqlbackend.SyncC
 		tr.SetError(err)
 		tr.Finish()
 	}()
-	if err := campaignsEnabled(); err != nil {
+	if err := campaignsEnabled(ctx); err != nil {
 		return nil, err
 	}
 
@@ -604,12 +698,114 @@ func (r *Resolver) SyncChangeset(ctx context.Context, args *graphqlbackend.SyncC
 	}
 
 	if changesetID == 0 {
-		return nil, ErrIDIsZero
+		return nil, ErrIDIsZero{}
 	}
 
 	// 🚨 SECURITY: EnqueueChangesetSync checks whether current user is authorized.
 	svc := ee.NewService(r.store, r.httpFactory)
 	if err = svc.EnqueueChangesetSync(ctx, changesetID); err != nil {
+		return nil, err
+	}
+
+	return &graphqlbackend.EmptyResponse{}, nil
+}
+
+func (r *Resolver) CreateCampaignsCredential(ctx context.Context, args *graphqlbackend.CreateCampaignsCredentialArgs) (_ graphqlbackend.CampaignsCredentialResolver, err error) {
+	tr, ctx := trace.New(ctx, "Resolver.CreateCampaignsCredential", fmt.Sprintf("%q (%q)", args.ExternalServiceKind, args.ExternalServiceURL))
+	defer func() {
+		tr.SetError(err)
+		tr.Finish()
+	}()
+	if err := campaignsEnabled(ctx); err != nil {
+		return nil, err
+	}
+
+	// Check user is authenticated.
+	user := actor.FromContext(ctx)
+	if !user.IsAuthenticated() {
+		return nil, backend.ErrNotAuthenticated
+	}
+
+	// Need to validate externalServiceKind, otherwise this'll panic.
+	kind, valid := extsvc.ParseServiceKind(args.ExternalServiceKind)
+	if !valid {
+		return nil, errors.New("invalid external service kind")
+	}
+
+	// TODO: Do we want to validate the URL, or even if such an external service exists? Or better, would the DB have a constraint?
+
+	if args.Credential == "" {
+		return nil, errors.New("empty credential not allowed")
+	}
+
+	scope := db.UserCredentialScope{
+		Domain:              db.UserCredentialDomainCampaigns,
+		ExternalServiceID:   args.ExternalServiceURL,
+		ExternalServiceType: extsvc.KindToType(kind),
+		UserID:              user.UID,
+	}
+
+	// Throw error documented in schema.graphql.
+	existing, err := db.UserCredentials.GetByScope(ctx, scope)
+	if err != nil && !errcode.IsNotFound(err) {
+		return nil, err
+	}
+	if existing != nil {
+		return nil, ErrDuplicateCredential{}
+	}
+
+	var a auth.Authenticator
+	if kind == extsvc.KindBitbucketServer {
+		svc := ee.NewService(r.store, r.httpFactory)
+		username, err := svc.FetchUsernameForBitbucketServerToken(ctx, args.ExternalServiceURL, extsvc.KindToType(kind), args.Credential)
+		if err != nil {
+			return nil, err
+		}
+		a = &auth.BasicAuth{Username: username, Password: args.Credential}
+	} else {
+		a = &auth.OAuthBearerToken{Token: args.Credential}
+	}
+
+	cred, err := db.UserCredentials.Create(ctx, scope, a)
+	if err != nil {
+		return nil, err
+	}
+
+	return &campaignsCredentialResolver{credential: cred}, nil
+}
+
+func (r *Resolver) DeleteCampaignsCredential(ctx context.Context, args *graphqlbackend.DeleteCampaignsCredentialArgs) (_ *graphqlbackend.EmptyResponse, err error) {
+	tr, ctx := trace.New(ctx, "Resolver.DeleteCampaignsCredential", fmt.Sprintf("Credential: %q", args.CampaignsCredential))
+	defer func() {
+		tr.SetError(err)
+		tr.Finish()
+	}()
+	if err := campaignsEnabled(ctx); err != nil {
+		return nil, err
+	}
+
+	dbID, err := unmarshalCampaignsCredentialID(args.CampaignsCredential)
+	if err != nil {
+		return nil, err
+	}
+
+	if dbID == 0 {
+		return nil, ErrIDIsZero{}
+	}
+
+	// Get existing credential.
+	cred, err := db.UserCredentials.GetByID(ctx, dbID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 🚨 SECURITY: Check that the requesting user may delete the credential.
+	if err := backend.CheckSiteAdminOrSameUser(ctx, cred.UserID); err != nil {
+		return nil, err
+	}
+
+	// This also fails if the credential was not found.
+	if err := db.UserCredentials.Delete(ctx, dbID); err != nil {
 		return nil, err
 	}
 

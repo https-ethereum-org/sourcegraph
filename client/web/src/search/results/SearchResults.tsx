@@ -11,6 +11,7 @@ import {
     CaseSensitivityProps,
     parseSearchURL,
     resolveVersionContext,
+    SearchStreamingProps,
 } from '..'
 import { Contributions, Evaluated } from '../../../../shared/src/api/protocol'
 import { FetchFileParameters } from '../../../../shared/src/components/CodeExcerpt'
@@ -26,9 +27,8 @@ import { ThemeProps } from '../../../../shared/src/theme'
 import { EventLogger } from '../../tracking/eventLogger'
 import { isSearchResults, submitSearch, toggleSearchFilter, getSearchTypeFromQuery, QueryState } from '../helpers'
 import { queryTelemetryData } from '../queryTelemetry'
-import { SearchResultsFilterBars, SearchScopeWithOptionalName } from './SearchResultsFilterBars'
+import { SearchResultsFilterBars, DynamicSearchFilter } from './SearchResultsFilterBars'
 import { SearchResultsList } from './SearchResultsList'
-import { SearchResultTypeTabs } from './SearchResultTypeTabs'
 import { buildSearchURLQuery } from '../../../../shared/src/util/url'
 import { VersionContextProps } from '../../../../shared/src/search/util'
 import { VersionContext } from '../../schema/site.schema'
@@ -49,7 +49,8 @@ export interface SearchResultsProps
         PatternTypeProps,
         CaseSensitivityProps,
         InteractiveSearchProps,
-        VersionContextProps {
+        VersionContextProps,
+        SearchStreamingProps {
     authenticatedUser: AuthenticatedUser | null
     location: H.Location
     history: H.History
@@ -289,6 +290,7 @@ export class SearchResults extends React.Component<SearchResultsProps, SearchRes
     public render(): JSX.Element | null {
         const query = parseSearchURLQuery(this.props.location.search)
         const filters = this.getFilters()
+        const repoFilters = this.getRepoFilters()
         const extensionFilters = this.state.contributions?.searchFilters
 
         const quickLinks =
@@ -300,9 +302,13 @@ export class SearchResults extends React.Component<SearchResultsProps, SearchRes
                 {!this.props.interactiveSearchMode && (
                     <SearchResultsFilterBars
                         navbarSearchQuery={this.props.navbarSearchQueryState.query}
-                        results={this.state.resultsOrError}
-                        filters={filters}
+                        searchSucceeded={isSearchResults(this.state.resultsOrError)}
+                        resultsLimitHit={
+                            isSearchResults(this.state.resultsOrError) && this.state.resultsOrError.limitHit
+                        }
+                        genericFilters={filters}
                         extensionFilters={extensionFilters}
+                        repoFilters={repoFilters}
                         quickLinks={quickLinks}
                         onFilterClick={this.onDynamicFilterClicked}
                         onShowMoreResultsClick={this.showMoreResults}
@@ -324,11 +330,6 @@ export class SearchResults extends React.Component<SearchResultsProps, SearchRes
                         </div>
                     </div>
                 )}
-                <SearchResultTypeTabs
-                    {...this.props}
-                    query={this.props.navbarSearchQueryState.query}
-                    filtersInQuery={this.props.filtersInQuery}
-                />
                 <SearchResultsList
                     {...this.props}
                     resultsOrError={this.state.resultsOrError}
@@ -346,8 +347,8 @@ export class SearchResults extends React.Component<SearchResultsProps, SearchRes
     }
 
     /** Combines dynamic filters and search scopes into a list de-duplicated by value. */
-    private getFilters(): SearchScopeWithOptionalName[] {
-        const filters = new Map<string, SearchScopeWithOptionalName>()
+    private getFilters(): DynamicSearchFilter[] {
+        const filters = new Map<string, DynamicSearchFilter>()
 
         if (isSearchResults(this.state.resultsOrError) && this.state.resultsOrError.dynamicFilters) {
             let dynamicFilters = this.state.resultsOrError.dynamicFilters
@@ -381,6 +382,21 @@ export class SearchResults extends React.Component<SearchResultsProps, SearchRes
 
         return [...filters.values()]
     }
+
+    private getRepoFilters(): DynamicSearchFilter[] | undefined {
+        if (isSearchResults(this.state.resultsOrError) && this.state.resultsOrError.dynamicFilters) {
+            return this.state.resultsOrError.dynamicFilters
+                .filter(filter => filter.kind === 'repo' && filter.value !== '')
+                .map(filter => ({
+                    name: filter.label,
+                    value: filter.value,
+                    count: filter.count,
+                    limitHit: filter.limitHit,
+                }))
+        }
+        return undefined
+    }
+
     private showMoreResults = (): void => {
         // Requery with an increased max result count.
         const parameters = new URLSearchParams(this.props.location.search)

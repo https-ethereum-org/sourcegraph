@@ -12,6 +12,7 @@ import {
 import { afterEachSaveScreenshotIfFailed } from '../../../shared/src/testing/screenshotReporter'
 import * as path from 'path'
 import { DiffHunkLineType } from '../graphql-operations'
+import { encodeURIComponentExceptSlashes } from '../../../shared/src/util/url'
 
 describe('Repository', () => {
     let driver: Driver
@@ -63,8 +64,7 @@ describe('Repository', () => {
                             ancestors: {
                                 nodes: [
                                     {
-                                        id:
-                                            'R2l0Q29tbWl0OnsiciI6IlVtVndiM05wZEc5eWVUbzBNRGsxTXpnPSIsImMiOiIxNWMyMjkwZGNiMzc3MzFjYzRlZTVhMmExYzFlNWEyNWI0YzI4ZjgxIn0=',
+                                        id: 'CommitID1',
                                         oid: '15c2290dcb37731cc4ee5a2a1c1e5a25b4c28f81',
                                         abbreviatedOID: '15c2290',
                                         message: 'update LSIF indexing CI workflow\n',
@@ -121,8 +121,7 @@ describe('Repository', () => {
                                         },
                                     },
                                     {
-                                        id:
-                                            'R2l0Q29tbWl0OnsiciI6IlVtVndiM05wZEc5eWVUbzBNRGsxTXpnPSIsImMiOiI5ZTYxNWIxYzMyY2M1MTkxMzA1NzVlOGQxMGQwZDBmZWU4YTVlYjZjIn0=',
+                                        id: 'CommitID2',
                                         oid: '9e615b1c32cc519130575e8d10d0d0fee8a5eb6c',
                                         abbreviatedOID: '9e615b1',
                                         message: 'LSIF Indexing Campaign',
@@ -173,8 +172,7 @@ describe('Repository', () => {
                                         },
                                     },
                                     {
-                                        id:
-                                            'R2l0Q29tbWl0OnsiciI6IlVtVndiM05wZEc5eWVUbzBNRGsxTXpnPSIsImMiOiI5NmM0ZWZhYjdlZTI4ZjNkMWNmMWQyNDhhMDEzOWNlYTM3MzY4YjE4In0=',
+                                        id: 'CommitID3',
                                         oid: '96c4efab7ee28f3d1cf1d248a0139cea37368b18',
                                         abbreviatedOID: '96c4efa',
                                         message:
@@ -242,8 +240,7 @@ describe('Repository', () => {
                         __typename: 'Repository',
                         commit: {
                             __typename: 'GitCommit',
-                            id:
-                                'R2l0Q29tbWl0OnsiciI6IlVtVndiM05wZEc5eWVUbzBNRGsxTXpnPSIsImMiOiIxNWMyMjkwZGNiMzc3MzFjYzRlZTVhMmExYzFlNWEyNWI0YzI4ZjgxIn0=',
+                            id: 'CommitID1',
                             oid: '15c2290dcb37731cc4ee5a2a1c1e5a25b4c28f81',
                             abbreviatedOID: '15c2290',
                             message: 'update LSIF indexing CI workflow\n',
@@ -388,13 +385,7 @@ describe('Repository', () => {
             const breadcrumbTexts = await driver.page.evaluate(() =>
                 [...document.querySelectorAll('.test-breadcrumb')].map(breadcrumb => breadcrumb.textContent)
             )
-            assert.deepStrictEqual(breadcrumbTexts, [
-                'Home',
-                'Repositories',
-                shortRepositoryName,
-                '@master',
-                clickedFileName,
-            ])
+            assert.deepStrictEqual(breadcrumbTexts, [shortRepositoryName, '@master', clickedFileName])
 
             // Return to repo page
             await driver.page.waitForSelector('a.repo-header__repo')
@@ -420,7 +411,9 @@ describe('Repository', () => {
                 ResolveRev: ({ repoName }) => createResolveRevisionResult(repoName),
                 FileExternalLinks: ({ filePath, repoName, revision }) =>
                     createFileExternalLinksResult(
-                        `https://${repoName}/blob/${revision}/${filePath.split('/').map(encodeURIComponent).join('/')}`
+                        `https://${encodeURIComponentExceptSlashes(repoName)}/blob/${encodeURIComponentExceptSlashes(
+                            revision
+                        )}/${encodeURIComponentExceptSlashes(filePath)}`
                     ),
                 TreeEntries: () => ({
                     repository: {
@@ -469,7 +462,7 @@ describe('Repository', () => {
             const breadcrumbTexts = await driver.page.evaluate(() =>
                 [...document.querySelectorAll('.test-breadcrumb')].map(breadcrumb => breadcrumb.textContent)
             )
-            assert.deepStrictEqual(breadcrumbTexts, ['Home', 'Repositories', shortRepositoryName, '@master', filePath])
+            assert.deepStrictEqual(breadcrumbTexts, [shortRepositoryName, '@master', filePath])
 
             await driver.page.waitForSelector('#monaco-query-input .view-lines')
             // TODO: find a more reliable way to get the current search query,
@@ -530,13 +523,7 @@ describe('Repository', () => {
             const breadcrumbTexts = await driver.page.evaluate(() =>
                 [...document.querySelectorAll('.test-breadcrumb')].map(breadcrumb => breadcrumb.textContent)
             )
-            assert.deepStrictEqual(breadcrumbTexts, [
-                'Home',
-                'Repositories',
-                shortRepositoryName,
-                '@master',
-                'readme.md',
-            ])
+            assert.deepStrictEqual(breadcrumbTexts, [shortRepositoryName, '@master', 'readme.md'])
         })
     })
 })

@@ -5,7 +5,8 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/sourcegraph/sourcegraph/enterprise/internal/codeintel/store"
+	"github.com/opentracing/opentracing-go/log"
+	"github.com/sourcegraph/sourcegraph/internal/observation"
 )
 
 type Status uint8
@@ -17,8 +18,15 @@ const (
 	Added
 )
 
-func DiffFileStatus(ctx context.Context, store store.Store, repositoryID int, baseCommit, headCommit string) (map[string]Status, error) {
-	output, err := execGitCommand(ctx, store, repositoryID, "diff", "--name-status", baseCommit, headCommit)
+func (c *Client) DiffFileStatus(ctx context.Context, repositoryID int, baseCommit, headCommit string) (_ map[string]Status, err error) {
+	ctx, endObservation := c.operations.diffFileStatus.With(ctx, &err, observation.Args{LogFields: []log.Field{
+		log.Int("repositoryID", repositoryID),
+		log.String("baseCommit", baseCommit),
+		log.String("headCommit", headCommit),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	output, err := c.execGitCommand(ctx, repositoryID, "diff", "--name-status", baseCommit, headCommit)
 	if err != nil {
 		return nil, err
 	}

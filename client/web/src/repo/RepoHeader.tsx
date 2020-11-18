@@ -214,13 +214,13 @@ export const RepoHeader: React.FunctionComponent<Props> = ({
                 ))}
             </ul>
             <div className="repo-header__spacer" />
-            <div className="d-flex align-items-center">
-                {determineShowAddExtensions(props) && (
-                    <ButtonLink to="/extensions" className="btn btn-outline-secondary btn-sm mx-2">
+            {determineShowAddExtensions(props) && (
+                <div className="d-none d-xl-flex align-items-center">
+                    <ButtonLink to="/extensions" className="btn btn-outline-secondary btn-sm mx-2 text-nowrap">
                         Add extensions
                     </ButtonLink>
-                )}
-            </div>
+                </div>
+            )}
             <ul className="navbar-nav">
                 <WebActionsNavItems
                     {...props}
@@ -248,7 +248,7 @@ export const RepoHeader: React.FunctionComponent<Props> = ({
                 ))}
                 {repo.viewerCanAdminister && (
                     <li className="nav-item repo-header__action-list-item">
-                        <ButtonLink to={`/${repo.name}/-/settings`} data-tooltip="Repository settings">
+                        <ButtonLink to={`${repo.url}/-/settings`} data-tooltip="Repository settings">
                             <SettingsIcon className="icon-inline" />{' '}
                             <span className="d-none d-lg-inline">Settings</span>
                         </ButtonLink>
